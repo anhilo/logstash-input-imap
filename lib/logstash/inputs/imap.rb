@@ -87,50 +87,56 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
 
   def run(queue)
     @run_thread = Thread.current
-    Stud.interval(@check_interval) do
-      check_mail(queue)
-    end
+    
+    check_mail(queue)
+    
   end
 
   def check_mail(queue)
     # TODO(sissel): handle exceptions happening during runtime:
     # EOFError, OpenSSL::SSL::SSLError
     imap = connect
-    imap.select(@folder)
-    if @uid_tracking && @uid_last_value
-      # If there are no new messages, uid_search returns @uid_last_value
-      # because it is the last message, so we need to delete it.
-      ids = imap.uid_search(["UID", (@uid_last_value+1..-1)]).delete_if { |uid|
-        uid <= @uid_last_value
-      }
-    else
-      ids = imap.uid_search("NOT SEEN")
-    end
+    folders = imap.list("","*")
+    folders.each do |item|
+      imap.select(item.name)
+      ids = imap.uid_search("ALL")
+      ids.each_slice(@fetch_count) do |id_set|
+        items = imap.uid_fetch(id_set, ["BODY.PEEK[]", "UID"])
+        items.each do |item|
+          next unless item.attr.has_key?("BODY[]")
+          mail = Mail.read_from_string(item.attr["BODY[]"])
+          if @strip_attachments
+            queue << parse_mail(mail.without_attachments!)
+          else
+            queue << parse_mail(mail)
+          end
+          # Mark message as processed
+          @uid_last_value = item.attr["UID"]
+          imap.uid_store(@uid_last_value, '+FLAGS', @delete || @expunge ? :Deleted : :Seen)
 
-    ids.each_slice(@fetch_count) do |id_set|
-      items = imap.uid_fetch(id_set, ["BODY.PEEK[]", "UID"])
-      items.each do |item|
-        next unless item.attr.has_key?("BODY[]")
-        mail = Mail.read_from_string(item.attr["BODY[]"])
-        if @strip_attachments
-          queue << parse_mail(mail.without_attachments!)
-        else
-          queue << parse_mail(mail)
+          # Stop message processing if it is requested
+          break if stop?
         end
-        # Mark message as processed
-        @uid_last_value = item.attr["UID"]
-        imap.uid_store(@uid_last_value, '+FLAGS', @delete || @expunge ? :Deleted : :Seen)
 
-        # Stop message processing if it is requested
+        # Expunge deleted messages
+        imap.expunge() if @expunge
+
+        # Stop message fetching if it is requested
         break if stop?
       end
-
-      # Expunge deleted messages
-      imap.expunge() if @expunge
-
-      # Stop message fetching if it is requested
-      break if stop?
     end
+    #imap.select(@folder)
+    #if @uid_tracking && @uid_last_value
+      # If there are no new messages, uid_search returns @uid_last_value
+      # because it is the last message, so we need to delete it.
+     # ids = imap.uid_search(["UID", (@uid_last_value+1..-1)]).delete_if { |uid|
+      #  uid <= @uid_last_value
+      #}
+    #else
+      
+    #end
+
+   
 
   rescue => e
     @logger.error("Encountered error #{e.class}", :message => e.message, :backtrace => e.backtrace)
